@@ -1,5 +1,5 @@
 // DemoApprox.cxx
-// Demonstrates 7 approximation (rebuild/fitting) use-cases using OCCT.
+// Demonstrates 8 approximation (rebuild/fitting) use-cases using OCCT.
 // Each demo writes input and result to separate OBJ files for visualization.
 //
 // Demos:
@@ -10,6 +10,7 @@
 //   9. Curve rebuild with cusp point (where tangent vanishes)
 //  10. Wiggly curve rebuild (interp points as preferred cut params via PrefAndRec)
 //  11. Discrete point fitting with mixed interp/approx constraints
+//  12. Wiggly curve rebuild with sparse interp points (3 preferred cuts)
 
 #include <AppDef_Variational.hxx>
 #include <AppDef_MultiLine.hxx>
@@ -1088,6 +1089,140 @@ static void Demo11_DiscretePointFitting()
 }
 
 // ===========================================================================
+// Demo 12: Wiggly curve rebuild with many interp points (18 preferred cuts)
+// ===========================================================================
+// Same wiggly helix as Demo 10, but with 18 preferred cut points spread
+// across the domain. Compare with Demo 10 (10 cuts) to see how denser
+// interp points affect the result quality at those locations.
+
+static void Demo12_WigglyCurveSparseInterp()
+{
+  const double t0 = 0.0, t1 = 4.0 * M_PI;
+
+  // 18 interp parameters spread evenly across the interior
+  const int nInterp = 18;
+  std::vector<double> interpParams;
+  for (int i = 1; i <= nInterp; ++i)
+    interpParams.push_back(t0 + (t1 - t0) * i / (nInterp + 1.0));
+
+  // Preferred cuts = interp params, recommended = midpoints between them
+  NCollection_Array1<double> pref(1, nInterp);
+  for (int i = 0; i < nInterp; ++i)
+    pref(i + 1) = interpParams[i];
+
+  std::vector<double> recVec;
+  recVec.push_back((t0 + interpParams[0]) / 2.0);
+  for (int i = 0; i < nInterp - 1; ++i)
+    recVec.push_back((interpParams[i] + interpParams[i + 1]) / 2.0);
+  recVec.push_back((interpParams.back() + t1) / 2.0);
+
+  NCollection_Array1<double> rec(1, (int)recVec.size());
+  for (int i = 0; i < (int)recVec.size(); ++i)
+    rec(i + 1) = recVec[i];
+
+  AdvApprox_PrefAndRec cutter(pref, rec);
+  WigglyCurveEvaluator evaluator;
+
+  occ::handle<NCollection_HArray1<double>> tol1d = new NCollection_HArray1<double>(1,0);
+  occ::handle<NCollection_HArray1<double>> tol2d = new NCollection_HArray1<double>(1,0);
+  occ::handle<NCollection_HArray1<double>> tol3d = new NCollection_HArray1<double>(1,1);
+  tol3d->SetValue(1, 0.05);
+
+  AdvApprox_ApproxAFunction approx(
+    /*Num1D=*/0, /*Num2D=*/0, /*Num3D=*/1,
+    tol1d, tol2d, tol3d,
+    /*First=*/t0, /*Last=*/t1,
+    /*Cont=*/GeomAbs_C2,
+    /*MaxDeg=*/9,
+    /*MaxSeg=*/60,
+    evaluator, cutter);
+
+  // Write wiggly input curve
+  {
+    ObjFile obj("demo12_input.obj");
+    obj.group("wiggly_curve");
+    obj.writeFunc([](double t) {
+      double r[3]; WigglyCurveD0(t, r);
+      return gp_Pnt(r[0], r[1], r[2]);
+    }, t0, t1, 600);
+  }
+
+  // Write sparse interp points
+  {
+    ObjFile obj("demo12_interp.obj");
+    obj.group("interp_points");
+    int base = obj.vcount;
+    for (double tp : interpParams) {
+      double r[3]; WigglyCurveD0(tp, r);
+      obj.vertex(gp_Pnt(r[0], r[1], r[2]));
+    }
+    for (int i = 1; i <= nInterp; ++i)
+      obj.f << "p " << (base + i) << "\n";
+  }
+
+  if (approx.IsDone() || approx.HasResult()) {
+    std::cout << "Demo12 (wiggly curve + 18 interp cuts):"
+              << "  degree=" << approx.Degree()
+              << "  nbKnots=" << approx.NbKnots()
+              << "  maxErr=" << approx.MaxError(3, 1) << "\n";
+
+    // Check which interp params became knots
+    auto knots = approx.Knots();
+    int nFound = 0;
+    for (double tp : interpParams) {
+      for (int i = knots->Lower(); i <= knots->Upper(); ++i) {
+        if (std::fabs(knots->Value(i) - tp) < 1.0e-8) { ++nFound; break; }
+      }
+    }
+    std::cout << "  interpParamsAsKnots=" << nFound << "/" << nInterp << "\n";
+
+    // Build BSpline curve
+    auto poles3d = approx.Poles();
+    auto knotsArr = approx.Knots();
+    auto mults = approx.Multiplicities();
+    int deg = approx.Degree();
+
+    NCollection_Array1<gp_Pnt> bsPoles(1, poles3d->ColLength());
+    for (int i = 1; i <= poles3d->ColLength(); ++i)
+      bsPoles(i) = poles3d->Value(i, 1);
+
+    NCollection_Array1<double> bsKnots(knotsArr->Lower(), knotsArr->Upper());
+    for (int i = knotsArr->Lower(); i <= knotsArr->Upper(); ++i)
+      bsKnots(i) = knotsArr->Value(i);
+
+    NCollection_Array1<int> bsMults(mults->Lower(), mults->Upper());
+    for (int i = mults->Lower(); i <= mults->Upper(); ++i)
+      bsMults(i) = mults->Value(i);
+
+    occ::handle<Geom_BSplineCurve> result =
+      new Geom_BSplineCurve(bsPoles, bsKnots, bsMults, deg);
+
+    PrintCurveInfo(result, "Demo12 result");
+
+    // Measure deviation at interp points
+    double maxInterpDev = 0.0;
+    for (double tp : interpParams) {
+      double r[3]; WigglyCurveD0(tp, r);
+      gp_Pnt orig(r[0], r[1], r[2]);
+      gp_Pnt cp; result->D0(tp, cp);
+      double d = orig.Distance(cp);
+      if (d > maxInterpDev) maxInterpDev = d;
+    }
+    std::cout << "  maxInterpDeviation=" << maxInterpDev << "\n";
+
+    {
+      ObjFile obj("demo12_output.obj");
+      obj.group("result_curve");
+      obj.writeCurve(result, 400);
+    }
+    { ObjFile obj("demo12_ctrl.obj"); obj.writeCtrlPoly(result); }
+  } else {
+    std::cout << "Demo12: failed\n";
+  }
+  std::cout << "  -> demo12_input.obj, demo12_interp.obj, demo12_output.obj, demo12_ctrl.obj\n";
+}
+
+// ===========================================================================
 // main
 // ===========================================================================
 int main()
@@ -1114,6 +1249,9 @@ int main()
 
   std::cout << "\n--- Demo 11: Discrete point fitting (mixed interp/approx) ---\n";
   Demo11_DiscretePointFitting();
+
+  std::cout << "\n--- Demo 12: Wiggly curve rebuild (18 interp cuts, relaxed tol) ---\n";
+  Demo12_WigglyCurveSparseInterp();
 
   std::cout << "\nDone.\n";
   return 0;
