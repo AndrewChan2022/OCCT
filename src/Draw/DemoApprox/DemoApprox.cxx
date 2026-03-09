@@ -1,6 +1,6 @@
 // DemoApprox.cxx
 // Demonstrates 4 approximation (rebuild/fitting) use-cases using OCCT.
-// Each demo writes input and result to OBJ files for visualization.
+// Each demo writes input and result to separate OBJ files for visualization.
 //
 // Demos:
 //   5. Single curve rebuild (sample D0 + D1 tangent + D2 curvature)
@@ -61,15 +61,53 @@ struct ObjFile {
     return ++vcount;
   }
 
-  // Write a polyline from a vector of points
+  // Write a polyline as consecutive 2-vertex line segments
   void writePolyline(const std::vector<gp_Pnt>& pts) {
-    if (pts.empty()) return;
+    if (pts.size() < 2) return;
     int base = vcount;
     for (auto& p : pts) vertex(p);
-    f << "l";
-    for (int i = 0; i < (int)pts.size(); ++i)
-      f << " " << (base + i + 1);
-    f << "\n";
+    for (int i = 0; i < (int)pts.size() - 1; ++i)
+      f << "l " << (base + i + 1) << " " << (base + i + 2) << "\n";
+  }
+
+  // Write BSpline curve control points and control polygon
+  void writeCtrlPoly(const occ::handle<Geom_BSplineCurve>& C) {
+    if (C.IsNull()) return;
+    int nP = C->NbPoles();
+    group("ctrl_points");
+    int base = vcount;
+    for (int i = 1; i <= nP; ++i) vertex(C->Pole(i));
+    for (int i = 0; i < nP; ++i)
+      f << "p " << (base + i + 1) << "\n";
+    group("ctrl_polygon");
+    for (int i = 0; i < nP - 1; ++i)
+      f << "l " << (base + i + 1) << " " << (base + i + 2) << "\n";
+  }
+
+  // Write BSpline surface control points and control net
+  void writeCtrlNet(const occ::handle<Geom_BSplineSurface>& S) {
+    if (S.IsNull()) return;
+    int nU = S->NbUPoles(), nV = S->NbVPoles();
+    group("ctrl_points");
+    int base = vcount;
+    for (int i = 1; i <= nU; ++i)
+      for (int j = 1; j <= nV; ++j)
+        vertex(S->Pole(i, j));
+    for (int i = 0; i < nU * nV; ++i)
+      f << "p " << (base + i + 1) << "\n";
+    group("ctrl_net_u");
+    for (int i = 0; i < nU; ++i)
+      for (int j = 0; j < nV - 1; ++j) {
+        int v0 = base + i * nV + j + 1;
+        f << "l " << v0 << " " << (v0 + 1) << "\n";
+      }
+    group("ctrl_net_v");
+    for (int j = 0; j < nV; ++j)
+      for (int i = 0; i < nU - 1; ++i) {
+        int v0 = base + i * nV + j + 1;
+        int v1 = base + (i + 1) * nV + j + 1;
+        f << "l " << v0 << " " << v1 << "\n";
+      }
   }
 
   // Sample a parametric function and write as polyline
@@ -136,12 +174,11 @@ static void PrintCurveInfo(const occ::handle<Geom_BSplineCurve>& C, const char* 
   std::cout << label
             << ": degree=" << C->Degree()
             << "  nbPoles=" << C->NbPoles()
-            << "  nbKnots=" << C->NbKnots()
-            << "\n";
+            << "  nbKnots=" << C->NbKnots() << "\n";
 }
 
 // ===========================================================================
-// Demo 5: Single curve rebuild — D0 + D1 + D2 sampling via Approx_Curve3d
+// Demo 5: Single curve rebuild
 // ===========================================================================
 
 class HelixAdaptor : public Adaptor3d_Curve
@@ -220,14 +257,18 @@ static void Demo5_SingleCurveRebuild()
   }
   std::cout << "  MaxError=" << rebuilder.MaxError() << "\n";
 
-  // Write OBJ
-  ObjFile obj("demo5_approx.obj");
-  obj.group("input_helix");
-  obj.writeFunc([&](double t) { return helix->Value(t); },
-                0.0, 2.0 * M_PI);
-  obj.group("result_curve");
-  obj.writeCurve(result);
-  std::cout << "  -> demo5_approx.obj\n";
+  {
+    ObjFile obj("demo5_input.obj");
+    obj.group("helix");
+    obj.writeFunc([&](double t) { return helix->Value(t); }, 0.0, 2.0 * M_PI);
+  }
+  {
+    ObjFile obj("demo5_output.obj");
+    obj.group("result_curve");
+    obj.writeCurve(result);
+  }
+  { ObjFile obj("demo5_ctrl.obj"); obj.writeCtrlPoly(result); }
+  std::cout << "  -> demo5_input.obj, demo5_output.obj, demo5_ctrl.obj\n";
 }
 
 // ===========================================================================
@@ -242,7 +283,9 @@ static void Demo6_CurveChainRebuild()
     { gp_Ax2(gp_Pnt(1,0,1), gp_Dir(0,1,0)), 1.0, 0.0,    M_PI/2.0 },
   };
 
-  ObjFile obj("demo6_approx.obj");
+  ObjFile objIn("demo6_input.obj");
+  ObjFile objOut("demo6_output.obj");
+  ObjFile objCtrl("demo6_ctrl.obj");
 
   for (int k = 0; k < (int)arcs.size(); ++k) {
     occ::handle<Geom_Circle> circ = new Geom_Circle(gp_Circ(arcs[k].ax, arcs[k].r));
@@ -255,36 +298,31 @@ static void Demo6_CurveChainRebuild()
                              /*MaxSeg=*/10,
                              /*MaxDeg=*/7);
 
-    char label[64];
+    char label[64], grp[64];
     std::snprintf(label, sizeof(label), "Demo6 segment %d", k + 1);
 
-    // Write input arc
-    char grp[64];
-    std::snprintf(grp, sizeof(grp), "input_arc_%d", k + 1);
-    obj.group(grp);
-    obj.writeFunc([&](double t) {
-      gp_Pnt p;
-      arc->D0(t, p);
-      return p;
-    }, arcs[k].t0, arcs[k].t1, 50);
+    std::snprintf(grp, sizeof(grp), "arc_%d", k + 1);
+    objIn.group(grp);
+    objIn.writeFunc([&](double t) { gp_Pnt p; arc->D0(t, p); return p; },
+                    arcs[k].t0, arcs[k].t1, 50);
 
     if (rebuilder.IsDone()) {
       PrintCurveInfo(rebuilder.Curve(), label);
-      std::snprintf(grp, sizeof(grp), "result_curve_%d", k + 1);
-      obj.group(grp);
-      obj.writeCurve(rebuilder.Curve(), 50);
+      std::snprintf(grp, sizeof(grp), "curve_%d", k + 1);
+      objOut.group(grp);
+      objOut.writeCurve(rebuilder.Curve(), 50);
+      objCtrl.writeCtrlPoly(rebuilder.Curve());
     } else {
       std::cout << label << ": partial, maxErr=" << rebuilder.MaxError() << "\n";
     }
   }
-  std::cout << "  -> demo6_approx.obj\n";
+  std::cout << "  -> demo6_input.obj, demo6_output.obj, demo6_ctrl.obj\n";
 }
 
 // ===========================================================================
 // Demo 7: Single curve rebuild with discontinuity parameters
 // ===========================================================================
 
-// Kink curve evaluator function (also used for OBJ sampling)
 static void KinkCurveD0(double t, double result[3])
 {
   if (t <= M_PI) {
@@ -352,14 +390,15 @@ static void Demo7_CurveRebuildWithDiscontinuity()
     /*MaxSeg=*/20,
     evaluator, cutter);
 
-  ObjFile obj("demo7_approx.obj");
-
-  // Write input kink curve
-  obj.group("input_kink_curve");
-  obj.writeFunc([](double t) {
-    double r[3]; KinkCurveD0(t, r);
-    return gp_Pnt(r[0], r[1], r[2]);
-  }, 0.0, 2.0 * M_PI);
+  // Write input
+  {
+    ObjFile obj("demo7_input.obj");
+    obj.group("kink_curve");
+    obj.writeFunc([](double t) {
+      double r[3]; KinkCurveD0(t, r);
+      return gp_Pnt(r[0], r[1], r[2]);
+    }, 0.0, 2.0 * M_PI);
+  }
 
   if (approx.IsDone()) {
     std::cout << "Demo7 (kink curve rebuild):"
@@ -394,19 +433,22 @@ static void Demo7_CurveRebuildWithDiscontinuity()
     occ::handle<Geom_BSplineCurve> resultCurve =
       new Geom_BSplineCurve(bsPoles, bsKnots, bsMults, deg);
 
+    ObjFile obj("demo7_output.obj");
     obj.group("result_curve");
     obj.writeCurve(resultCurve);
+
+    ObjFile objCtrl("demo7_ctrl.obj");
+    objCtrl.writeCtrlPoly(resultCurve);
   } else {
     std::cout << "Demo7: HasResult=" << approx.HasResult() << "\n";
   }
-  std::cout << "  -> demo7_approx.obj\n";
+  std::cout << "  -> demo7_input.obj, demo7_output.obj, demo7_ctrl.obj\n";
 }
 
 // ===========================================================================
 // Demo 8: Surface rebuild via AdvApp2Var
 // ===========================================================================
 
-// Torus D0 function (also used for OBJ sampling)
 static gp_Pnt TorusD0(double u, double v)
 {
   const double R = 2.0, r = 0.5;
@@ -522,12 +564,13 @@ static void Demo8_SurfaceRebuild()
     /*MaxPatch=*/16,
     evaluator, ucutter, vcutter);
 
-  ObjFile obj("demo8_approx.obj");
-
   // Write input torus patch
-  obj.group("input_torus");
-  obj.writeFuncSurf([](double u, double v) { return TorusD0(u, v); },
-                    u0, u1, v0, v1, 30, 30);
+  {
+    ObjFile obj("demo8_input.obj");
+    obj.group("torus");
+    obj.writeFuncSurf([](double u, double v) { return TorusD0(u, v); },
+                      u0, u1, v0, v1, 30, 30);
+  }
 
   if (approx.IsDone()) {
     occ::handle<Geom_BSplineSurface> surf =
@@ -537,17 +580,21 @@ static void Demo8_SurfaceRebuild()
                 << "  degU=" << surf->UDegree()
                 << "  degV=" << surf->VDegree()
                 << "  nPolesU=" << surf->NbUPoles()
-                << "  nPolesV=" << surf->NbVPoles()
-                << "\n";
+                << "  nPolesV=" << surf->NbVPoles() << "\n";
+
+      ObjFile obj("demo8_output.obj");
       obj.group("result_surface");
       obj.writeSurface(surf, 30, 30);
+
+      ObjFile objCtrl("demo8_ctrl.obj");
+      objCtrl.writeCtrlNet(surf);
     }
     std::cout << "  maxErr3D=" << approx.MaxError(3, 1) << "\n";
     std::cout << "  avgErr3D=" << approx.AverageError(3, 1) << "\n";
   } else {
     std::cout << "Demo8: HasResult=" << approx.HasResult() << "\n";
   }
-  std::cout << "  -> demo8_approx.obj\n";
+  std::cout << "  -> demo8_input.obj, demo8_output.obj, demo8_ctrl.obj\n";
 }
 
 // ===========================================================================

@@ -13,6 +13,8 @@ set(OCCT_Draw_LIST_OF_TOOLKITS
   TKQADraw
   TKIVtkDraw
   DRAWEXE
+  DemoInterp
+  DemoApprox
   TKXSDRAWDE
   TKXSDRAWGLTF
   TKXSDRAWIGES
