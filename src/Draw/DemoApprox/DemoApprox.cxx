@@ -1,5 +1,5 @@
 // DemoApprox.cxx
-// Demonstrates 4 approximation (rebuild/fitting) use-cases using OCCT.
+// Demonstrates 7 approximation (rebuild/fitting) use-cases using OCCT.
 // Each demo writes input and result to separate OBJ files for visualization.
 //
 // Demos:
@@ -7,7 +7,16 @@
 //   6. Curve chain rebuild (multiple segments, matching at joints)
 //   7. Single curve rebuild with prescribed discontinuity parameters
 //   8. Surface rebuild (sample D0 + first/second derivatives)
+//   9. Curve rebuild with cusp point (where tangent vanishes)
+//  10. Wiggly curve rebuild (high-freq perturbation, high tolerance, interp points)
+//  11. Discrete point fitting with mixed interp/approx constraints
 
+#include <AppDef_Variational.hxx>
+#include <AppDef_MultiLine.hxx>
+#include <AppDef_MultiPointConstraint.hxx>
+#include <AppParCurves_Constraint.hxx>
+#include <AppParCurves_ConstraintCouple.hxx>
+#include <AppParCurves_MultiBSpCurve.hxx>
 #include <Approx_Curve3d.hxx>
 #include <Geom_BSplineCurve.hxx>
 #include <GeomAdaptor_Curve.hxx>
@@ -272,24 +281,33 @@ static void Demo5_SingleCurveRebuild()
 }
 
 // ===========================================================================
-// Demo 6: Curve chain rebuild
+// Demo 6: Curve chain rebuild (parallel cross-sections for lofting)
 // ===========================================================================
+// Vase-shaped cross-sections: circles at different heights with varying radii.
+// All share the same parameter range [0, 2*pi], like sections prepared for loft.
 static void Demo6_CurveChainRebuild()
 {
-  struct ArcDef { gp_Ax2 ax; double r; double t0; double t1; };
-  std::vector<ArcDef> arcs = {
-    { gp_Ax2(gp_Pnt(0,0,0), gp_Dir(0,0,1)), 1.0, 0.0,    M_PI/2.0 },
-    { gp_Ax2(gp_Pnt(1,1,0), gp_Dir(1,0,0)), 1.0, -M_PI/2.0, 0.0  },
-    { gp_Ax2(gp_Pnt(1,0,1), gp_Dir(0,1,0)), 1.0, 0.0,    M_PI/2.0 },
+  // Cross-section radii and heights (vase profile)
+  struct Section { double z; double r; };
+  std::vector<Section> sections = {
+    { 0.0, 1.0 },   // base
+    { 1.0, 0.5 },   // neck
+    { 2.0, 0.8 },   // bulge
+    { 3.0, 1.2 },   // rim
   };
 
   ObjFile objIn("demo6_input.obj");
   ObjFile objOut("demo6_output.obj");
   ObjFile objCtrl("demo6_ctrl.obj");
 
-  for (int k = 0; k < (int)arcs.size(); ++k) {
-    occ::handle<Geom_Circle> circ = new Geom_Circle(gp_Circ(arcs[k].ax, arcs[k].r));
-    occ::handle<Geom_TrimmedCurve> arc = new Geom_TrimmedCurve(circ, arcs[k].t0, arcs[k].t1);
+  for (int k = 0; k < (int)sections.size(); ++k) {
+    double z = sections[k].z;
+    double r = sections[k].r;
+
+    occ::handle<Geom_Circle> circ =
+      new Geom_Circle(gp_Circ(gp_Ax2(gp_Pnt(0, 0, z), gp_Dir(0, 0, 1)), r));
+    occ::handle<Geom_TrimmedCurve> arc =
+      new Geom_TrimmedCurve(circ, 0.0, 2.0 * M_PI);
     occ::handle<GeomAdaptor_Curve> hAdaptor = new GeomAdaptor_Curve(arc);
 
     Approx_Curve3d rebuilder(hAdaptor,
@@ -299,18 +317,18 @@ static void Demo6_CurveChainRebuild()
                              /*MaxDeg=*/7);
 
     char label[64], grp[64];
-    std::snprintf(label, sizeof(label), "Demo6 segment %d", k + 1);
+    std::snprintf(label, sizeof(label), "Demo6 section %d (z=%.1f, r=%.1f)", k + 1, z, r);
 
-    std::snprintf(grp, sizeof(grp), "arc_%d", k + 1);
+    std::snprintf(grp, sizeof(grp), "section_%d", k + 1);
     objIn.group(grp);
     objIn.writeFunc([&](double t) { gp_Pnt p; arc->D0(t, p); return p; },
-                    arcs[k].t0, arcs[k].t1, 50);
+                    0.0, 2.0 * M_PI, 100);
 
     if (rebuilder.IsDone()) {
       PrintCurveInfo(rebuilder.Curve(), label);
       std::snprintf(grp, sizeof(grp), "curve_%d", k + 1);
       objOut.group(grp);
-      objOut.writeCurve(rebuilder.Curve(), 50);
+      objOut.writeCurve(rebuilder.Curve(), 100);
       objCtrl.writeCtrlPoly(rebuilder.Curve());
     } else {
       std::cout << label << ": partial, maxErr=" << rebuilder.MaxError() << "\n";
@@ -598,6 +616,449 @@ static void Demo8_SurfaceRebuild()
 }
 
 // ===========================================================================
+// Demo 9: Curve rebuild with cusp point (tangent vanishes)
+// ===========================================================================
+// Semicubical parabola: P(t) = (t^2, t^3, 0.3*t) for t in [-1, 1].
+// At t=0 the tangent P'(0) = (0, 0, 0.3) is non-zero in z but the
+// x-y projection has a cusp (dx/dt=0, dy/dt=0 at t=0).
+// We use a true cusp: P(t) = (t^2, t^3, 0) so P'(0) = (0, 0, 0).
+
+static void CuspCurveD0(double t, double result[3])
+{
+  result[0] = t * t;
+  result[1] = t * t * t;
+  result[2] = 0.0;
+}
+
+class CuspCurveEvaluator : public AdvApprox_EvaluatorFunction
+{
+public:
+  void Evaluate(int*    /*Dimension*/,
+                double  /*StartEnd*/[2],
+                double* Parameter,
+                int*    DerivativeRequest,
+                double* Result,
+                int*    ErrorCode) override
+  {
+    double t  = *Parameter;
+    int    d  = *DerivativeRequest;
+    *ErrorCode = 0;
+
+    if (d == 0) {
+      CuspCurveD0(t, Result);
+    } else if (d == 1) {
+      // P'(t) = (2t, 3t^2, 0)  — vanishes at t=0
+      Result[0] = 2.0 * t;
+      Result[1] = 3.0 * t * t;
+      Result[2] = 0.0;
+    } else if (d == 2) {
+      // P''(t) = (2, 6t, 0)
+      Result[0] = 2.0;
+      Result[1] = 6.0 * t;
+      Result[2] = 0.0;
+    }
+  }
+};
+
+static void Demo9_CurveRebuildWithCusp()
+{
+  // The cusp is at t=0, mark it as preferred cut point
+  NCollection_Array1<double> pref(1, 1);  pref(1) = 0.0;
+  NCollection_Array1<double> rec (1, 2);
+  rec(1) = -0.5;
+  rec(2) =  0.5;
+
+  AdvApprox_PrefAndRec cutter(pref, rec);
+  CuspCurveEvaluator   evaluator;
+
+  occ::handle<NCollection_HArray1<double>> tol1d = new NCollection_HArray1<double>(1,0);
+  occ::handle<NCollection_HArray1<double>> tol2d = new NCollection_HArray1<double>(1,0);
+  occ::handle<NCollection_HArray1<double>> tol3d = new NCollection_HArray1<double>(1,1);
+  tol3d->SetValue(1, 1.0e-4);
+
+  AdvApprox_ApproxAFunction approx(
+    /*Num1D=*/0, /*Num2D=*/0, /*Num3D=*/1,
+    tol1d, tol2d, tol3d,
+    /*First=*/-1.0, /*Last=*/1.0,
+    /*Cont=*/GeomAbs_C0,
+    /*MaxDeg=*/9,
+    /*MaxSeg=*/30,
+    evaluator, cutter);
+
+  // Write input
+  {
+    ObjFile obj("demo9_input.obj");
+    obj.group("cusp_curve");
+    obj.writeFunc([](double t) {
+      double r[3]; CuspCurveD0(t, r);
+      return gp_Pnt(r[0], r[1], r[2]);
+    }, -1.0, 1.0, 300);
+  }
+
+  if (approx.IsDone()) {
+    std::cout << "Demo9 (cusp curve rebuild):"
+              << "  degree=" << approx.Degree()
+              << "  nbKnots=" << approx.NbKnots()
+              << "  maxErr=" << approx.MaxError(3, 1) << "\n";
+
+    auto knots = approx.Knots();
+    bool foundCusp = false;
+    for (int i = knots->Lower(); i <= knots->Upper(); ++i) {
+      if (std::fabs(knots->Value(i)) < 1.0e-8) { foundCusp = true; break; }
+    }
+    std::cout << "  cusp knot at t=0 found: " << (foundCusp ? "YES" : "NO") << "\n";
+
+    // Build BSpline curve from AdvApprox result
+    auto poles3d = approx.Poles();
+    auto knotsArr = approx.Knots();
+    auto mults = approx.Multiplicities();
+    int deg = approx.Degree();
+
+    NCollection_Array1<gp_Pnt> bsPoles(1, poles3d->ColLength());
+    for (int i = 1; i <= poles3d->ColLength(); ++i)
+      bsPoles(i) = poles3d->Value(i, 1);
+
+    NCollection_Array1<double> bsKnots(knotsArr->Lower(), knotsArr->Upper());
+    for (int i = knotsArr->Lower(); i <= knotsArr->Upper(); ++i)
+      bsKnots(i) = knotsArr->Value(i);
+
+    NCollection_Array1<int> bsMults(mults->Lower(), mults->Upper());
+    for (int i = mults->Lower(); i <= mults->Upper(); ++i)
+      bsMults(i) = mults->Value(i);
+
+    occ::handle<Geom_BSplineCurve> resultCurve =
+      new Geom_BSplineCurve(bsPoles, bsKnots, bsMults, deg);
+
+    PrintCurveInfo(resultCurve, "Demo9 result");
+
+    ObjFile obj("demo9_output.obj");
+    obj.group("result_curve");
+    obj.writeCurve(resultCurve, 300);
+
+    ObjFile objCtrl("demo9_ctrl.obj");
+    objCtrl.writeCtrlPoly(resultCurve);
+  } else {
+    std::cout << "Demo9: HasResult=" << approx.HasResult() << "\n";
+  }
+  std::cout << "  -> demo9_input.obj, demo9_output.obj, demo9_ctrl.obj\n";
+}
+
+// ===========================================================================
+// Demo 10: Wiggly curve rebuild with high tolerance
+// ===========================================================================
+// A helix perturbed by high-frequency sine waves with varying frequency.
+// The small-scale wiggles make exact approximation expensive. With a
+// relatively high tolerance the rebuilder smooths them out, so some
+// "interpolation points" (sampled from the true wiggly curve) are NOT
+// passed through by the result. We output those interp points to a
+// separate file so we can visualise which ones the result misses.
+
+class WigglyCurveAdaptor : public Adaptor3d_Curve
+{
+public:
+  WigglyCurveAdaptor(double t0, double t1) : myT0(t0), myT1(t1) {}
+
+  double FirstParameter() const override { return myT0; }
+  double LastParameter()  const override { return myT1; }
+
+  // Helix + high-freq radial wiggle whose frequency increases with t
+  void D0(const double t, gp_Pnt& P) const override {
+    double freq = 3.0 + 4.0 * t / (2.0 * M_PI);    // frequency ramps up
+    double wiggle = 0.04 * std::sin(freq * t);      // radial perturbation
+    double R = 1.0 + wiggle;
+    P.SetCoord(R * std::cos(t), R * std::sin(t), 0.15 * t);
+  }
+  void D1(const double t, gp_Pnt& P, gp_Vec& V) const override {
+    D0(t, P);
+    double h = 1.0e-7;
+    gp_Pnt P1; D0(t + h, P1);
+    V.SetCoord((P1.X()-P.X())/h, (P1.Y()-P.Y())/h, (P1.Z()-P.Z())/h);
+  }
+  void D2(const double t, gp_Pnt& P, gp_Vec& V1, gp_Vec& V2) const override {
+    double h = 1.0e-6;
+    gp_Pnt Pm, Pp; gp_Vec Vm, Vp;
+    D1(t, P, V1);
+    D1(t - h, Pm, Vm);
+    D1(t + h, Pp, Vp);
+    V2.SetCoord((Vp.X()-Vm.X())/(2*h), (Vp.Y()-Vm.Y())/(2*h), (Vp.Z()-Vm.Z())/(2*h));
+  }
+
+  GeomAbs_Shape Continuity() const override { return GeomAbs_CN; }
+  GeomAbs_CurveType GetType() const override { return GeomAbs_OtherCurve; }
+  gp_Lin Line() const override { return gp_Lin(); }
+  gp_Circ Circle() const override { return gp_Circ(); }
+  gp_Elips Ellipse() const override { return gp_Elips(); }
+  gp_Hypr Hyperbola() const override { return gp_Hypr(); }
+  gp_Parab Parabola() const override { return gp_Parab(); }
+  int Degree() const override { return 3; }
+  bool IsRational() const override { return false; }
+  bool IsPeriodic() const override { return false; }
+  double Period() const override { return 2.0 * M_PI; }
+  int NbPoles() const override { return 0; }
+  int NbKnots() const override { return 0; }
+  occ::handle<Geom_BezierCurve> Bezier() const override { return {}; }
+  occ::handle<Geom_BSplineCurve> BSpline() const override { return {}; }
+  occ::handle<Geom_OffsetCurve> OffsetCurve() const override { return {}; }
+  int NbIntervals(const GeomAbs_Shape) const override { return 1; }
+  void Intervals(NCollection_Array1<double>& T, const GeomAbs_Shape) const override {
+    T(T.Lower()) = myT0; T(T.Upper()) = myT1;
+  }
+  occ::handle<Adaptor3d_Curve> Trim(double f, double l, double) const override {
+    return new WigglyCurveAdaptor(f, l);
+  }
+  gp_Vec DN(const double t, const int N) const override {
+    gp_Pnt P; gp_Vec V1, V2;
+    if (N == 1) { D1(t,P,V1); return V1; }
+    if (N == 2) { D2(t,P,V1,V2); return V2; }
+    return gp_Vec();
+  }
+  gp_Pnt Value(const double t) const override { gp_Pnt P; D0(t,P); return P; }
+
+private:
+  double myT0, myT1;
+};
+
+static void Demo10_WigglyCurveRebuild()
+{
+  const double t0 = 0.0, t1 = 4.0 * M_PI;
+  occ::handle<WigglyCurveAdaptor> wiggly = new WigglyCurveAdaptor(t0, t1);
+
+  // Tolerance set between wiggle amplitude and zero — rebuilder can't
+  // capture all wiggles within budget, so some interp points are missed.
+  const double tol = 0.02;
+  Approx_Curve3d rebuilder(wiggly,
+                           /*Tol3d=*/tol,
+                           /*Order=*/GeomAbs_C2,
+                           /*MaxSeg=*/12,
+                           /*MaxDeg=*/8);
+
+  occ::handle<Geom_BSplineCurve> result;
+  if (rebuilder.IsDone()) {
+    result = rebuilder.Curve();
+    PrintCurveInfo(result, "Demo10 (wiggly curve rebuild)");
+    std::cout << "  MaxError=" << rebuilder.MaxError() << "\n";
+  } else {
+    std::cout << "Demo10: HasResult=" << rebuilder.HasResult()
+              << "  MaxError=" << rebuilder.MaxError() << "\n";
+    if (rebuilder.HasResult()) result = rebuilder.Curve();
+  }
+
+  // Write wiggly input curve (high-res sampling to see the wiggles)
+  {
+    ObjFile obj("demo10_input.obj");
+    obj.group("wiggly_curve");
+    obj.writeFunc([&](double t) { return wiggly->Value(t); }, t0, t1, 600);
+  }
+
+  // Write interpolation points — uniformly sampled from the true wiggly curve.
+  // These are the points we want the result to pass through.
+  const int nInterp = 80;
+  {
+    ObjFile obj("demo10_interp.obj");
+    obj.group("interp_points");
+    int base = obj.vcount;
+    for (int i = 0; i < nInterp; ++i) {
+      double t = t0 + (t1 - t0) * i / (nInterp - 1);
+      obj.vertex(wiggly->Value(t));
+    }
+    for (int i = 1; i <= nInterp; ++i)
+      obj.f << "p " << (base + i) << "\n";
+  }
+
+  if (!result.IsNull()) {
+    // Measure per-point deviation of interp points vs result curve
+    double maxDev = 0.0;
+    int nFar = 0;
+    for (int i = 0; i < nInterp; ++i) {
+      double t = t0 + (t1 - t0) * i / (nInterp - 1);
+      gp_Pnt sp = wiggly->Value(t);
+      // Evaluate result at same parameter
+      double u = result->FirstParameter()
+               + (result->LastParameter() - result->FirstParameter())
+               * (t - t0) / (t1 - t0);
+      gp_Pnt cp; result->D0(u, cp);
+      double d = sp.Distance(cp);
+      if (d > maxDev) maxDev = d;
+      if (d > tol) ++nFar;
+    }
+    std::cout << "  interpMaxDev=" << maxDev
+              << "  pointsBeyondTol(" << tol << ")=" << nFar
+              << "/" << nInterp << "\n";
+
+    {
+      ObjFile obj("demo10_output.obj");
+      obj.group("result_curve");
+      obj.writeCurve(result, 400);
+    }
+    { ObjFile obj("demo10_ctrl.obj"); obj.writeCtrlPoly(result); }
+  }
+  std::cout << "  -> demo10_input.obj, demo10_interp.obj, demo10_output.obj, demo10_ctrl.obj\n";
+}
+
+// ===========================================================================
+// Demo 11: Discrete point fitting with mixed interp/approx constraints
+// ===========================================================================
+// Dense noisy point cloud sampled from a figure-8 curve. Every 50th point
+// is a PassPoint (must interpolate exactly); the rest are NoConstraint
+// (least-squares approximated). Tolerance is set high enough that the
+// non-interp points visibly deviate. Outputs interp points to separate file.
+
+static void Demo11_DiscretePointFitting()
+{
+  // Figure-8 curve in 3D: x = sin(t), y = sin(t)*cos(t), z = 0.3*sin(2t)
+  auto figurePt = [](double t) -> gp_Pnt {
+    return gp_Pnt(std::sin(t),
+                  std::sin(t) * std::cos(t),
+                  0.3 * std::sin(2.0 * t));
+  };
+
+  // Deterministic noise
+  auto noise = [](int i, int ch) -> double {
+    unsigned seed = (unsigned)(i * 73856093 ^ ch * 19349663);
+    seed = (seed ^ (seed >> 13)) * 1274126177u;
+    seed = seed ^ (seed >> 16);
+    return ((double)(seed & 0xFFFF) / 32768.0 - 1.0);  // in [-1, 1]
+  };
+
+  // Dense sampling: 500 points with noise
+  const int N = 500;
+  const double t0 = 0.0, t1 = 2.0 * M_PI;
+  const double noiseAmp = 0.03;
+
+  // Build AppDef_MultiLine from noisy 3D points
+  NCollection_Array1<AppDef_MultiPointConstraint> tabMPC(1, N);
+  std::vector<gp_Pnt> allPts(N + 1);  // store for OBJ output (1-based)
+  for (int i = 1; i <= N; ++i) {
+    double t = t0 + (t1 - t0) * (i - 1) / (N - 1);
+    gp_Pnt p = figurePt(t);
+    // Add noise to non-interp points
+    bool isInterp = (i == 1 || i == N || (i % 50 == 1));
+    if (!isInterp) {
+      p.SetCoord(p.X() + noise(i, 0) * noiseAmp,
+                 p.Y() + noise(i, 1) * noiseAmp,
+                 p.Z() + noise(i, 2) * noiseAmp);
+    }
+    allPts[i] = p;
+    NCollection_Array1<gp_Pnt> pts(1, 1);
+    pts(1) = p;
+    tabMPC(i) = AppDef_MultiPointConstraint(pts);
+  }
+  AppDef_MultiLine multiLine(tabMPC);
+
+  // Build constraints: every 50th point is PassPoint (exact interp),
+  // first and last always PassPoint, rest are NoConstraint (approx).
+  occ::handle<NCollection_HArray1<AppParCurves_ConstraintCouple>> constraints =
+    new NCollection_HArray1<AppParCurves_ConstraintCouple>(1, N);
+
+  std::vector<int> interpIdx;  // 1-based indices of interp points
+  for (int i = 1; i <= N; ++i) {
+    bool isInterp = (i == 1 || i == N || (i % 50 == 1));
+    if (isInterp) {
+      constraints->SetValue(i, AppParCurves_ConstraintCouple(i, AppParCurves_PassPoint));
+      interpIdx.push_back(i);
+    } else {
+      constraints->SetValue(i, AppParCurves_ConstraintCouple(i, AppParCurves_NoConstraint));
+    }
+  }
+
+  std::cout << "  nPoints=" << N << "  nPassPoints=" << interpIdx.size() << "\n";
+
+  AppDef_Variational variational(
+    multiLine,
+    /*FirstPoint=*/1,
+    /*LastPoint=*/N,
+    constraints,
+    /*MaxDegree=*/8,
+    /*MaxSegment=*/20,
+    /*Continuity=*/GeomAbs_C2,
+    /*WithMinMax=*/false,
+    /*WithCutting=*/true,
+    /*Tolerance=*/0.05,
+    /*NbIterations=*/3);
+
+  variational.Approximate();
+
+  if (!variational.IsDone()) {
+    std::cout << "Demo11: Variational failed. IsOverConstrained="
+              << variational.IsOverConstrained() << "\n";
+    return;
+  }
+
+  AppParCurves_MultiBSpCurve mbsc = variational.Value();
+  std::cout << "Demo11 (discrete point fitting):"
+            << "  degree=" << mbsc.Degree()
+            << "  nbPoles=" << mbsc.NbPoles()
+            << "  maxErr=" << variational.MaxError()
+            << "  avgErr=" << variational.AverageError() << "\n";
+
+  // Build Geom_BSplineCurve from MultiBSpCurve result (curve index 1)
+  int nPoles = mbsc.NbPoles();
+  NCollection_Array1<gp_Pnt> bsPoles(1, nPoles);
+  for (int i = 1; i <= nPoles; ++i)
+    bsPoles(i) = mbsc.Pole(1, i);
+
+  const auto& knots = mbsc.Knots();
+  const auto& mults = mbsc.Multiplicities();
+  int deg = mbsc.Degree();
+
+  occ::handle<Geom_BSplineCurve> result =
+    new Geom_BSplineCurve(bsPoles, knots, mults, deg);
+
+  PrintCurveInfo(result, "Demo11 result");
+
+  // Write all noisy sample points as input
+  {
+    ObjFile obj("demo11_input.obj");
+    obj.group("all_points");
+    int base = obj.vcount;
+    for (int i = 1; i <= N; ++i) obj.vertex(allPts[i]);
+    for (int i = 1; i <= N; ++i)
+      obj.f << "p " << (base + i) << "\n";
+  }
+
+  // Write interp (PassPoint) points to separate file — these are exact (no noise)
+  {
+    ObjFile obj("demo11_interp.obj");
+    obj.group("interp_points");
+    int base = obj.vcount;
+    for (int idx : interpIdx) obj.vertex(allPts[idx]);
+    for (int i = 1; i <= (int)interpIdx.size(); ++i)
+      obj.f << "p " << (base + i) << "\n";
+  }
+
+  // Write result curve
+  {
+    ObjFile obj("demo11_output.obj");
+    obj.group("result_curve");
+    obj.writeCurve(result, 400);
+  }
+  { ObjFile obj("demo11_ctrl.obj"); obj.writeCtrlPoly(result); }
+
+  // Measure deviation using the Variational's own parameters
+  auto params = variational.Parameters();
+  double maxInterpErr = 0.0, maxApproxErr = 0.0;
+  int nApproxFar = 0;
+  for (int i = 1; i <= N; ++i) {
+    gp_Pnt orig = allPts[i];
+    double u = params->Value(i);
+    gp_Pnt cp; result->D0(u, cp);
+    double d = orig.Distance(cp);
+
+    bool isInterp = (i == 1 || i == N || (i % 50 == 1));
+    if (isInterp) {
+      if (d > maxInterpErr) maxInterpErr = d;
+    } else {
+      if (d > maxApproxErr) maxApproxErr = d;
+      if (d > 0.01) ++nApproxFar;
+    }
+  }
+  std::cout << "  maxInterpErr=" << maxInterpErr
+            << "  maxApproxErr=" << maxApproxErr
+            << "  approxPointsFar(>0.01)=" << nApproxFar << "\n";
+  std::cout << "  -> demo11_input.obj, demo11_interp.obj, demo11_output.obj, demo11_ctrl.obj\n";
+}
+
+// ===========================================================================
 // main
 // ===========================================================================
 int main()
@@ -607,7 +1068,7 @@ int main()
   std::cout << "--- Demo 5: Single curve rebuild (D0+D1+D2, C2) ---\n";
   Demo5_SingleCurveRebuild();
 
-  std::cout << "\n--- Demo 6: Curve chain rebuild (3 arcs, C1 each) ---\n";
+  std::cout << "\n--- Demo 6: Curve chain rebuild (vase cross-sections) ---\n";
   Demo6_CurveChainRebuild();
 
   std::cout << "\n--- Demo 7: Curve rebuild with discontinuity at pi ---\n";
@@ -615,6 +1076,15 @@ int main()
 
   std::cout << "\n--- Demo 8: Surface rebuild (torus patch, C1 x C1) ---\n";
   Demo8_SurfaceRebuild();
+
+  std::cout << "\n--- Demo 9: Curve rebuild with cusp point (t^2, t^3) ---\n";
+  Demo9_CurveRebuildWithCusp();
+
+  std::cout << "\n--- Demo 10: Wiggly curve rebuild (high-freq + high tol) ---\n";
+  Demo10_WigglyCurveRebuild();
+
+  std::cout << "\n--- Demo 11: Discrete point fitting (mixed interp/approx) ---\n";
+  Demo11_DiscretePointFitting();
 
   std::cout << "\nDone.\n";
   return 0;
