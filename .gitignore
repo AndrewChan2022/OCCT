@@ -22,6 +22,8 @@
 !/tests/
 !/tools/
 !/.github/
+!/mydoc
+!/mydemo
 
 # data/ level: Ignore everything except tracked subdirectories
 /data/*
