@@ -24,6 +24,7 @@
 !/.github/
 !/mydoc
 !/mydemo
+!/CLAUDE.md
 
 # data/ level: Ignore everything except tracked subdirectories
 /data/*
