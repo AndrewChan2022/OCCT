@@ -258,10 +258,9 @@ static void Demo2_CurveInterpEndTangents()
               << "  inputLast =(" << inputPts.back().X()  << ", " << inputPts.back().Y()  << ", " << inputPts.back().Z()  << ")\n";
   }
 
+  { ObjFile obj("demo2_input.obj"); obj.group("points"); obj.writePoints(inputPts); }
   {
-    ObjFile obj("demo2_input.obj");
-    obj.group("points");
-    obj.writePoints(inputPts);
+    ObjFile obj("demo2_input_tangent.obj");
     obj.group("end_tangents");
     std::vector<gp_Pnt> endPts = { inputPts.front(), inputPts.back() };
     std::vector<gp_Vec> endTangs = { tangFirst, tangLast };
@@ -269,7 +268,7 @@ static void Demo2_CurveInterpEndTangents()
   }
   { ObjFile obj("demo2_output.obj"); obj.group("result_curve"); obj.writeCurve(curve, 500); }
   { ObjFile obj("demo2_ctrl.obj");   obj.writeCtrlPoly(curve); }
-  std::cout << "  -> demo2_input.obj, demo2_output.obj, demo2_ctrl.obj\n";
+  std::cout << "  -> demo2_input.obj, demo2_input_tangent.obj, demo2_output.obj, demo2_ctrl.obj\n";
 }
 
 // ===========================================================================
@@ -302,16 +301,15 @@ static void Demo3_CurveInterpAllTangents()
   occ::handle<Geom_BSplineCurve> curve = interp.Curve();
   PrintCurveInfo(curve, "Demo3 (per-point tangent interp)");
 
+  { ObjFile obj("demo3_input.obj"); obj.group("points"); obj.writePoints(inputPts); }
   {
-    ObjFile obj("demo3_input.obj");
-    obj.group("points");
-    obj.writePoints(inputPts);
+    ObjFile obj("demo3_input_tangent.obj");
     obj.group("tangents");
     obj.writeTangentArrows(inputPts, inputTangs);
   }
   { ObjFile obj("demo3_output.obj"); obj.group("result_curve"); obj.writeCurve(curve); }
   { ObjFile obj("demo3_ctrl.obj");   obj.writeCtrlPoly(curve); }
-  std::cout << "  -> demo3_input.obj, demo3_output.obj, demo3_ctrl.obj\n";
+  std::cout << "  -> demo3_input.obj, demo3_input_tangent.obj, demo3_output.obj, demo3_ctrl.obj\n";
 }
 
 // ===========================================================================
