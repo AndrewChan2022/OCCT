@@ -34,6 +34,8 @@
 #include <AdvApp2Var_EvaluatorFunc2Var.hxx>
 #include <AdvApprox_Cutting.hxx>
 
+#include <GeomConvert_CompCurveToBSplineCurve.hxx>
+#include <Precision.hxx>
 #include <GeomAbs_Shape.hxx>
 #include <GeomAbs_IsoType.hxx>
 #include <NCollection_Array1.hxx>
@@ -1089,53 +1091,92 @@ static void Demo11_DiscretePointFitting()
 }
 
 // ===========================================================================
-// Demo 12: Wiggly curve rebuild with many interp points (18 preferred cuts)
+// Demo 12: Wiggly curve rebuild with forced interp points (pre-segmentation)
 // ===========================================================================
-// Same wiggly helix as Demo 10, but with 18 preferred cut points spread
-// across the domain. Compare with Demo 10 (10 cuts) to see how denser
-// interp points affect the result quality at those locations.
+// Same wiggly helix as Demo 10. Here we force interp points to be exact
+// by pre-segmenting the domain at interp parameters. Each segment is fitted
+// independently with AdvApprox, then concatenated into a single BSpline.
+// At segment boundaries (= interp params), the curve exactly passes through
+// the function values. Compare with Demo 10 where interp points are only
+// suggestions (PrefAndRec).
+
+// Helper: build a Geom_BSplineCurve from AdvApprox_ApproxAFunction result
+static occ::handle<Geom_BSplineCurve> BuildBSplineFromApprox(
+  const AdvApprox_ApproxAFunction& approx)
+{
+  auto poles3d = approx.Poles();
+  auto knotsArr = approx.Knots();
+  auto mults = approx.Multiplicities();
+  int deg = approx.Degree();
+
+  NCollection_Array1<gp_Pnt> bsPoles(1, poles3d->ColLength());
+  for (int i = 1; i <= poles3d->ColLength(); ++i)
+    bsPoles(i) = poles3d->Value(i, 1);
+
+  NCollection_Array1<double> bsKnots(knotsArr->Lower(), knotsArr->Upper());
+  for (int i = knotsArr->Lower(); i <= knotsArr->Upper(); ++i)
+    bsKnots(i) = knotsArr->Value(i);
+
+  NCollection_Array1<int> bsMults(mults->Lower(), mults->Upper());
+  for (int i = mults->Lower(); i <= mults->Upper(); ++i)
+    bsMults(i) = mults->Value(i);
+
+  return new Geom_BSplineCurve(bsPoles, bsKnots, bsMults, deg);
+}
 
 static void Demo12_WigglyCurveSparseInterp()
 {
   const double t0 = 0.0, t1 = 4.0 * M_PI;
+  const double tolerance = 0.05;
 
-  // 18 interp parameters spread evenly across the interior
+  // 18 interp parameters — these become forced segment boundaries
   const int nInterp = 18;
   std::vector<double> interpParams;
   for (int i = 1; i <= nInterp; ++i)
     interpParams.push_back(t0 + (t1 - t0) * i / (nInterp + 1.0));
 
-  // Preferred cuts = interp params, recommended = midpoints between them
-  NCollection_Array1<double> pref(1, nInterp);
-  for (int i = 0; i < nInterp; ++i)
-    pref(i + 1) = interpParams[i];
+  // Segment boundaries: t0, interp[0], ..., interp[n-1], t1
+  std::vector<double> segments = {t0};
+  for (double tp : interpParams) segments.push_back(tp);
+  segments.push_back(t1);
 
-  std::vector<double> recVec;
-  recVec.push_back((t0 + interpParams[0]) / 2.0);
-  for (int i = 0; i < nInterp - 1; ++i)
-    recVec.push_back((interpParams[i] + interpParams[i + 1]) / 2.0);
-  recVec.push_back((interpParams.back() + t1) / 2.0);
+  // Fit each segment independently
+  std::vector<occ::handle<Geom_BSplineCurve>> pieces;
+  int totalKnots = 0;
+  for (int s = 0; s + 1 < (int)segments.size(); ++s) {
+    double a = segments[s], b = segments[s + 1];
 
-  NCollection_Array1<double> rec(1, (int)recVec.size());
-  for (int i = 0; i < (int)recVec.size(); ++i)
-    rec(i + 1) = recVec[i];
+    WigglyCurveEvaluator evaluator;
+    AdvApprox_DichoCutting cutter;
 
-  AdvApprox_PrefAndRec cutter(pref, rec);
-  WigglyCurveEvaluator evaluator;
+    auto tol1d = new NCollection_HArray1<double>(1, 0);
+    auto tol2d = new NCollection_HArray1<double>(1, 0);
+    auto tol3d = new NCollection_HArray1<double>(1, 1);
+    tol3d->SetValue(1, tolerance);
 
-  occ::handle<NCollection_HArray1<double>> tol1d = new NCollection_HArray1<double>(1,0);
-  occ::handle<NCollection_HArray1<double>> tol2d = new NCollection_HArray1<double>(1,0);
-  occ::handle<NCollection_HArray1<double>> tol3d = new NCollection_HArray1<double>(1,1);
-  tol3d->SetValue(1, 0.05);
+    AdvApprox_ApproxAFunction approx(
+      0, 0, 1, tol1d, tol2d, tol3d,
+      a, b, GeomAbs_C2, 9, 20, evaluator, cutter);
 
-  AdvApprox_ApproxAFunction approx(
-    /*Num1D=*/0, /*Num2D=*/0, /*Num3D=*/1,
-    tol1d, tol2d, tol3d,
-    /*First=*/t0, /*Last=*/t1,
-    /*Cont=*/GeomAbs_C2,
-    /*MaxDeg=*/9,
-    /*MaxSeg=*/60,
-    evaluator, cutter);
+    if (!approx.IsDone() && !approx.HasResult()) {
+      std::cout << "  segment [" << a << ", " << b << "] failed\n";
+      continue;
+    }
+    totalKnots += approx.NbKnots();
+    pieces.push_back(BuildBSplineFromApprox(approx));
+  }
+
+  std::cout << "Demo12: fitted " << pieces.size() << "/" << segments.size() - 1
+            << " segments, totalKnots=" << totalKnots << "\n";
+
+  // Concatenate all pieces into one BSpline
+  occ::handle<Geom_BSplineCurve> result;
+  if (!pieces.empty()) {
+    GeomConvert_CompCurveToBSplineCurve concat(pieces[0]);
+    for (int i = 1; i < (int)pieces.size(); ++i)
+      concat.Add(pieces[i], Precision::Confusion());
+    result = concat.BSplineCurve();
+  }
 
   // Write wiggly input curve
   {
@@ -1147,7 +1188,7 @@ static void Demo12_WigglyCurveSparseInterp()
     }, t0, t1, 600);
   }
 
-  // Write sparse interp points
+  // Write interp points
   {
     ObjFile obj("demo12_interp.obj");
     obj.group("interp_points");
@@ -1160,46 +1201,10 @@ static void Demo12_WigglyCurveSparseInterp()
       obj.f << "p " << (base + i) << "\n";
   }
 
-  if (approx.IsDone() || approx.HasResult()) {
-    std::cout << "Demo12 (wiggly curve + 18 interp cuts):"
-              << "  degree=" << approx.Degree()
-              << "  nbKnots=" << approx.NbKnots()
-              << "  maxErr=" << approx.MaxError(3, 1) << "\n";
-
-    // Check which interp params became knots
-    auto knots = approx.Knots();
-    int nFound = 0;
-    for (double tp : interpParams) {
-      for (int i = knots->Lower(); i <= knots->Upper(); ++i) {
-        if (std::fabs(knots->Value(i) - tp) < 1.0e-8) { ++nFound; break; }
-      }
-    }
-    std::cout << "  interpParamsAsKnots=" << nFound << "/" << nInterp << "\n";
-
-    // Build BSpline curve
-    auto poles3d = approx.Poles();
-    auto knotsArr = approx.Knots();
-    auto mults = approx.Multiplicities();
-    int deg = approx.Degree();
-
-    NCollection_Array1<gp_Pnt> bsPoles(1, poles3d->ColLength());
-    for (int i = 1; i <= poles3d->ColLength(); ++i)
-      bsPoles(i) = poles3d->Value(i, 1);
-
-    NCollection_Array1<double> bsKnots(knotsArr->Lower(), knotsArr->Upper());
-    for (int i = knotsArr->Lower(); i <= knotsArr->Upper(); ++i)
-      bsKnots(i) = knotsArr->Value(i);
-
-    NCollection_Array1<int> bsMults(mults->Lower(), mults->Upper());
-    for (int i = mults->Lower(); i <= mults->Upper(); ++i)
-      bsMults(i) = mults->Value(i);
-
-    occ::handle<Geom_BSplineCurve> result =
-      new Geom_BSplineCurve(bsPoles, bsKnots, bsMults, deg);
-
+  if (!result.IsNull()) {
     PrintCurveInfo(result, "Demo12 result");
 
-    // Measure deviation at interp points
+    // Measure deviation at interp points (should be ~machine precision)
     double maxInterpDev = 0.0;
     for (double tp : interpParams) {
       double r[3]; WigglyCurveD0(tp, r);
@@ -1209,6 +1214,19 @@ static void Demo12_WigglyCurveSparseInterp()
       if (d > maxInterpDev) maxInterpDev = d;
     }
     std::cout << "  maxInterpDeviation=" << maxInterpDev << "\n";
+
+    // Measure overall max error by sampling
+    double maxErr = 0.0;
+    int nSample = 2000;
+    for (int i = 0; i <= nSample; ++i) {
+      double t = t0 + (t1 - t0) * i / nSample;
+      double r[3]; WigglyCurveD0(t, r);
+      gp_Pnt orig(r[0], r[1], r[2]);
+      gp_Pnt cp; result->D0(t, cp);
+      double d = orig.Distance(cp);
+      if (d > maxErr) maxErr = d;
+    }
+    std::cout << "  maxSampledError=" << maxErr << "  tol=" << tolerance << "\n";
 
     {
       ObjFile obj("demo12_output.obj");
