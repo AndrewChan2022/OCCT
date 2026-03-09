@@ -8,7 +8,7 @@
 //   7. Single curve rebuild with prescribed discontinuity parameters
 //   8. Surface rebuild (sample D0 + first/second derivatives)
 //   9. Curve rebuild with cusp point (where tangent vanishes)
-//  10. Wiggly curve rebuild (high-freq perturbation, high tolerance, interp points)
+//  10. Wiggly curve rebuild (interp points as preferred cut params via PrefAndRec)
 //  11. Discrete point fitting with mixed interp/approx constraints
 
 #include <AppDef_Variational.hxx>
@@ -744,146 +744,173 @@ static void Demo9_CurveRebuildWithCusp()
 }
 
 // ===========================================================================
-// Demo 10: Wiggly curve rebuild with high tolerance
+// Demo 10: Wiggly curve rebuild with interp points as preferred cuts
 // ===========================================================================
-// A helix perturbed by high-frequency sine waves with varying frequency.
-// The small-scale wiggles make exact approximation expensive. With a
-// relatively high tolerance the rebuilder smooths them out, so some
-// "interpolation points" (sampled from the true wiggly curve) are NOT
-// passed through by the result. We output those interp points to a
-// separate file so we can visualise which ones the result misses.
+// A helix perturbed by high-frequency sine waves. We pick a set of "interp"
+// parameter values and pass them as preferred cut points to
+// AdvApprox_PrefAndRec. The algorithm places knots at those parameters,
+// so the result passes very close to (or exactly through) the wiggly curve
+// at those locations, even though the overall tolerance is high and the
+// rest of the wiggles are smoothed out.
 
-class WigglyCurveAdaptor : public Adaptor3d_Curve
+static void WigglyCurveD0(double t, double result[3])
+{
+  double freq = 3.0 + 4.0 * t / (2.0 * M_PI);
+  double wiggle = 0.04 * std::sin(freq * t);
+  double R = 1.0 + wiggle;
+  result[0] = R * std::cos(t);
+  result[1] = R * std::sin(t);
+  result[2] = 0.15 * t;
+}
+
+class WigglyCurveEvaluator : public AdvApprox_EvaluatorFunction
 {
 public:
-  WigglyCurveAdaptor(double t0, double t1) : myT0(t0), myT1(t1) {}
+  void Evaluate(int*    /*Dimension*/,
+                double  /*StartEnd*/[2],
+                double* Parameter,
+                int*    DerivativeRequest,
+                double* Result,
+                int*    ErrorCode) override
+  {
+    double t  = *Parameter;
+    int    d  = *DerivativeRequest;
+    *ErrorCode = 0;
 
-  double FirstParameter() const override { return myT0; }
-  double LastParameter()  const override { return myT1; }
-
-  // Helix + high-freq radial wiggle whose frequency increases with t
-  void D0(const double t, gp_Pnt& P) const override {
-    double freq = 3.0 + 4.0 * t / (2.0 * M_PI);    // frequency ramps up
-    double wiggle = 0.04 * std::sin(freq * t);      // radial perturbation
-    double R = 1.0 + wiggle;
-    P.SetCoord(R * std::cos(t), R * std::sin(t), 0.15 * t);
-  }
-  void D1(const double t, gp_Pnt& P, gp_Vec& V) const override {
-    D0(t, P);
     double h = 1.0e-7;
-    gp_Pnt P1; D0(t + h, P1);
-    V.SetCoord((P1.X()-P.X())/h, (P1.Y()-P.Y())/h, (P1.Z()-P.Z())/h);
+    if (d == 0) {
+      WigglyCurveD0(t, Result);
+    } else if (d == 1) {
+      double r0[3], r1[3];
+      WigglyCurveD0(t - h, r0); WigglyCurveD0(t + h, r1);
+      for (int i = 0; i < 3; ++i) Result[i] = (r1[i] - r0[i]) / (2.0 * h);
+    } else if (d == 2) {
+      double h2 = 1.0e-5;
+      double r0[3], r1[3], r2[3];
+      WigglyCurveD0(t - h2, r0); WigglyCurveD0(t, r1); WigglyCurveD0(t + h2, r2);
+      for (int i = 0; i < 3; ++i) Result[i] = (r0[i] - 2*r1[i] + r2[i]) / (h2*h2);
+    }
   }
-  void D2(const double t, gp_Pnt& P, gp_Vec& V1, gp_Vec& V2) const override {
-    double h = 1.0e-6;
-    gp_Pnt Pm, Pp; gp_Vec Vm, Vp;
-    D1(t, P, V1);
-    D1(t - h, Pm, Vm);
-    D1(t + h, Pp, Vp);
-    V2.SetCoord((Vp.X()-Vm.X())/(2*h), (Vp.Y()-Vm.Y())/(2*h), (Vp.Z()-Vm.Z())/(2*h));
-  }
-
-  GeomAbs_Shape Continuity() const override { return GeomAbs_CN; }
-  GeomAbs_CurveType GetType() const override { return GeomAbs_OtherCurve; }
-  gp_Lin Line() const override { return gp_Lin(); }
-  gp_Circ Circle() const override { return gp_Circ(); }
-  gp_Elips Ellipse() const override { return gp_Elips(); }
-  gp_Hypr Hyperbola() const override { return gp_Hypr(); }
-  gp_Parab Parabola() const override { return gp_Parab(); }
-  int Degree() const override { return 3; }
-  bool IsRational() const override { return false; }
-  bool IsPeriodic() const override { return false; }
-  double Period() const override { return 2.0 * M_PI; }
-  int NbPoles() const override { return 0; }
-  int NbKnots() const override { return 0; }
-  occ::handle<Geom_BezierCurve> Bezier() const override { return {}; }
-  occ::handle<Geom_BSplineCurve> BSpline() const override { return {}; }
-  occ::handle<Geom_OffsetCurve> OffsetCurve() const override { return {}; }
-  int NbIntervals(const GeomAbs_Shape) const override { return 1; }
-  void Intervals(NCollection_Array1<double>& T, const GeomAbs_Shape) const override {
-    T(T.Lower()) = myT0; T(T.Upper()) = myT1;
-  }
-  occ::handle<Adaptor3d_Curve> Trim(double f, double l, double) const override {
-    return new WigglyCurveAdaptor(f, l);
-  }
-  gp_Vec DN(const double t, const int N) const override {
-    gp_Pnt P; gp_Vec V1, V2;
-    if (N == 1) { D1(t,P,V1); return V1; }
-    if (N == 2) { D2(t,P,V1,V2); return V2; }
-    return gp_Vec();
-  }
-  gp_Pnt Value(const double t) const override { gp_Pnt P; D0(t,P); return P; }
-
-private:
-  double myT0, myT1;
 };
 
 static void Demo10_WigglyCurveRebuild()
 {
   const double t0 = 0.0, t1 = 4.0 * M_PI;
-  occ::handle<WigglyCurveAdaptor> wiggly = new WigglyCurveAdaptor(t0, t1);
 
-  // Tolerance set between wiggle amplitude and zero — rebuilder can't
-  // capture all wiggles within budget, so some interp points are missed.
-  const double tol = 0.02;
-  Approx_Curve3d rebuilder(wiggly,
-                           /*Tol3d=*/tol,
-                           /*Order=*/GeomAbs_C2,
-                           /*MaxSeg=*/12,
-                           /*MaxDeg=*/8);
-
-  occ::handle<Geom_BSplineCurve> result;
-  if (rebuilder.IsDone()) {
-    result = rebuilder.Curve();
-    PrintCurveInfo(result, "Demo10 (wiggly curve rebuild)");
-    std::cout << "  MaxError=" << rebuilder.MaxError() << "\n";
-  } else {
-    std::cout << "Demo10: HasResult=" << rebuilder.HasResult()
-              << "  MaxError=" << rebuilder.MaxError() << "\n";
-    if (rebuilder.HasResult()) result = rebuilder.Curve();
+  // Choose interp parameters: 10 evenly-spaced interior points
+  const int nInterp = 10;
+  std::vector<double> interpParams;
+  for (int i = 1; i <= nInterp; ++i) {
+    double t = t0 + (t1 - t0) * i / (nInterp + 1);
+    interpParams.push_back(t);
   }
 
-  // Write wiggly input curve (high-res sampling to see the wiggles)
+  // Use interp params as PREFERRED cut points, midpoints as recommended
+  NCollection_Array1<double> pref(1, nInterp);
+  for (int i = 0; i < nInterp; ++i)
+    pref(i + 1) = interpParams[i];
+
+  // Recommended cuts: midpoints between consecutive preferred cuts
+  std::vector<double> recVec;
+  recVec.push_back((t0 + interpParams[0]) / 2.0);
+  for (int i = 0; i < nInterp - 1; ++i)
+    recVec.push_back((interpParams[i] + interpParams[i + 1]) / 2.0);
+  recVec.push_back((interpParams.back() + t1) / 2.0);
+
+  NCollection_Array1<double> rec(1, (int)recVec.size());
+  for (int i = 0; i < (int)recVec.size(); ++i)
+    rec(i + 1) = recVec[i];
+
+  AdvApprox_PrefAndRec cutter(pref, rec);
+  WigglyCurveEvaluator evaluator;
+
+  occ::handle<NCollection_HArray1<double>> tol1d = new NCollection_HArray1<double>(1,0);
+  occ::handle<NCollection_HArray1<double>> tol2d = new NCollection_HArray1<double>(1,0);
+  occ::handle<NCollection_HArray1<double>> tol3d = new NCollection_HArray1<double>(1,1);
+  tol3d->SetValue(1, 0.02);
+
+  AdvApprox_ApproxAFunction approx(
+    /*Num1D=*/0, /*Num2D=*/0, /*Num3D=*/1,
+    tol1d, tol2d, tol3d,
+    /*First=*/t0, /*Last=*/t1,
+    /*Cont=*/GeomAbs_C2,
+    /*MaxDeg=*/9,
+    /*MaxSeg=*/40,
+    evaluator, cutter);
+
+  // Write wiggly input curve (high-res sampling)
   {
     ObjFile obj("demo10_input.obj");
     obj.group("wiggly_curve");
-    obj.writeFunc([&](double t) { return wiggly->Value(t); }, t0, t1, 600);
+    obj.writeFunc([](double t) {
+      double r[3]; WigglyCurveD0(t, r);
+      return gp_Pnt(r[0], r[1], r[2]);
+    }, t0, t1, 600);
   }
 
-  // Write interpolation points — uniformly sampled from the true wiggly curve.
-  // These are the points we want the result to pass through.
-  const int nInterp = 80;
+  // Write interp points
   {
     ObjFile obj("demo10_interp.obj");
     obj.group("interp_points");
     int base = obj.vcount;
-    for (int i = 0; i < nInterp; ++i) {
-      double t = t0 + (t1 - t0) * i / (nInterp - 1);
-      obj.vertex(wiggly->Value(t));
+    for (double tp : interpParams) {
+      double r[3]; WigglyCurveD0(tp, r);
+      obj.vertex(gp_Pnt(r[0], r[1], r[2]));
     }
     for (int i = 1; i <= nInterp; ++i)
       obj.f << "p " << (base + i) << "\n";
   }
 
-  if (!result.IsNull()) {
-    // Measure per-point deviation of interp points vs result curve
-    double maxDev = 0.0;
-    int nFar = 0;
-    for (int i = 0; i < nInterp; ++i) {
-      double t = t0 + (t1 - t0) * i / (nInterp - 1);
-      gp_Pnt sp = wiggly->Value(t);
-      // Evaluate result at same parameter
-      double u = result->FirstParameter()
-               + (result->LastParameter() - result->FirstParameter())
-               * (t - t0) / (t1 - t0);
-      gp_Pnt cp; result->D0(u, cp);
-      double d = sp.Distance(cp);
-      if (d > maxDev) maxDev = d;
-      if (d > tol) ++nFar;
+  if (approx.IsDone() || approx.HasResult()) {
+    std::cout << "Demo10 (wiggly curve + preferred cuts):"
+              << "  degree=" << approx.Degree()
+              << "  nbKnots=" << approx.NbKnots()
+              << "  maxErr=" << approx.MaxError(3, 1) << "\n";
+
+    // Check which interp params became knots
+    auto knots = approx.Knots();
+    int nFound = 0;
+    for (double tp : interpParams) {
+      for (int i = knots->Lower(); i <= knots->Upper(); ++i) {
+        if (std::fabs(knots->Value(i) - tp) < 1.0e-8) { ++nFound; break; }
+      }
     }
-    std::cout << "  interpMaxDev=" << maxDev
-              << "  pointsBeyondTol(" << tol << ")=" << nFar
-              << "/" << nInterp << "\n";
+    std::cout << "  interpParamsAsKnots=" << nFound << "/" << nInterp << "\n";
+
+    // Build BSpline curve
+    auto poles3d = approx.Poles();
+    auto knotsArr = approx.Knots();
+    auto mults = approx.Multiplicities();
+    int deg = approx.Degree();
+
+    NCollection_Array1<gp_Pnt> bsPoles(1, poles3d->ColLength());
+    for (int i = 1; i <= poles3d->ColLength(); ++i)
+      bsPoles(i) = poles3d->Value(i, 1);
+
+    NCollection_Array1<double> bsKnots(knotsArr->Lower(), knotsArr->Upper());
+    for (int i = knotsArr->Lower(); i <= knotsArr->Upper(); ++i)
+      bsKnots(i) = knotsArr->Value(i);
+
+    NCollection_Array1<int> bsMults(mults->Lower(), mults->Upper());
+    for (int i = mults->Lower(); i <= mults->Upper(); ++i)
+      bsMults(i) = mults->Value(i);
+
+    occ::handle<Geom_BSplineCurve> result =
+      new Geom_BSplineCurve(bsPoles, bsKnots, bsMults, deg);
+
+    PrintCurveInfo(result, "Demo10 result");
+
+    // Measure deviation at interp points — should be very small since
+    // the preferred cuts place knots there
+    double maxInterpDev = 0.0;
+    for (double tp : interpParams) {
+      double r[3]; WigglyCurveD0(tp, r);
+      gp_Pnt orig(r[0], r[1], r[2]);
+      gp_Pnt cp; result->D0(tp, cp);
+      double d = orig.Distance(cp);
+      if (d > maxInterpDev) maxInterpDev = d;
+    }
+    std::cout << "  maxInterpDeviation=" << maxInterpDev << "\n";
 
     {
       ObjFile obj("demo10_output.obj");
@@ -891,6 +918,8 @@ static void Demo10_WigglyCurveRebuild()
       obj.writeCurve(result, 400);
     }
     { ObjFile obj("demo10_ctrl.obj"); obj.writeCtrlPoly(result); }
+  } else {
+    std::cout << "Demo10: failed\n";
   }
   std::cout << "  -> demo10_input.obj, demo10_interp.obj, demo10_output.obj, demo10_ctrl.obj\n";
 }
